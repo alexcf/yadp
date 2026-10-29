@@ -1,5 +1,6 @@
 import { BadGatewayException, BadRequestException, Inject, Injectable } from "@nestjs/common";
 import type { Request } from "express";
+import { readExternalIdentity, mergeExternalClients } from "../integrations/identity-provider";
 
 import { AuditService } from "../audit/audit.service";
 import { getRequestIp } from "../common/http/request-context";
@@ -304,10 +305,13 @@ export class ClientsService {
     const baselineMetadata = await this.readBaselineMetadata(baseline, locale).catch(() => ({
       clientsByHwaddr: new Map<string, BaselineClientMetadata>(),
     }));
-    const allHwaddrs = [...new Set(snapshots.flatMap((snapshot) => [...snapshot.devicesByHwaddr.keys()]))];
+    const identity = readExternalIdentity();
+    const allHwaddrs = [...new Set([...snapshots.flatMap((snapshot) => [...snapshot.devicesByHwaddr.keys()]), ...identity.devices.map(device => device.mac)])];
     const supportEntries = await this.loadSupportEntries(allHwaddrs);
-    const availableTags = await this.loadAvailableTags();
-    const items = this.buildListedClients(snapshots, baseline.id, baselineMetadata.clientsByHwaddr, supportEntries);
+    let availableTags = await this.loadAvailableTags();
+    const nativeItems = this.buildListedClients(snapshots, baseline.id, baselineMetadata.clientsByHwaddr, supportEntries);
+    const items = mergeExternalClients(nativeItems, identity.devices, supportEntries, this.toSourceSummary(baseline), identity.stale, identity.provider);
+    availableTags = [...new Set([...availableTags, ...items.flatMap(item => item.tags)])].sort();
     const filteredItems = searchTerm.length > 0 ? items.filter((item) => matchesClientSearch(item, searchTerm)) : items;
     const tagFilteredItems =
       excludedTags.length > 0
@@ -315,7 +319,7 @@ export class ClientsService {
         : filteredItems;
     const sortedItems = sortClientItems(tagFilteredItems, query.sortBy, query.sortDirection);
 
-    await this.persistSupportEntries(items, supportEntries);
+    await this.persistSupportEntries(nativeItems, supportEntries);
 
     const totalItems = sortedItems.length;
     const totalPages = Math.max(1, Math.ceil(totalItems / query.pageSize));
@@ -354,6 +358,7 @@ export class ClientsService {
     try {
       const instances = await this.loadManagedInstances(locale);
       const targetInstances = this.resolveSaveTargets(instances, dto.targetInstanceIds, locale);
+      if (dto.groups !== undefined || dto.comment !== undefined) await this.guardDHCPPolicyTargets(clients, targetInstances, locale);
       const baselineGroups =
         requestedGroupIds.length > 0 ? await this.readBaselineGroups(instances, requestedGroupIds, locale) : null;
       await this.persistRequestedSupportMetadata(clients, alias, tags);
@@ -451,6 +456,7 @@ export class ClientsService {
 
     try {
       const instances = await this.loadManagedInstances(locale);
+      if (dto.groups !== undefined) await this.guardDHCPPolicyTargets([client], instances, locale);
       const baselineGroups =
         requestedGroupIds === undefined
           ? null
@@ -568,6 +574,17 @@ export class ClientsService {
       });
 
       throw error;
+    }
+  }
+
+  private async guardDHCPPolicyTargets(clients: string[], instances: ManagedInstanceRecord[], locale: ReturnType<typeof getRequestLocale>) {
+    const imported = new Set(readExternalIdentity().devices.map(device => device.mac));
+    const selected = clients.filter(client => imported.has(client));
+    if (selected.length === 0) return;
+    const { snapshots } = await this.prepareDeviceSnapshotsForList(instances, locale);
+    const observed = new Set(snapshots.flatMap(snapshot => [...snapshot.devicesByHwaddr.keys()]));
+    if (selected.some(client => !observed.has(client))) {
+      throw new BadRequestException("This device is known from an external DHCP inventory, not a Pi-hole-observed MAC. Use an IP-based client policy for routed/VLAN devices; a MAC rule cannot reliably match their DNS traffic. This identity import does not assign policies.");
     }
   }
 

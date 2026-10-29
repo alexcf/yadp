@@ -1,5 +1,6 @@
 import { BadRequestException, Inject, Injectable, Logger } from "@nestjs/common";
 import type { Request } from "express";
+import { readExternalIdentity, mergeExternalAliases } from "../integrations/identity-provider";
 
 import { getRequestLocale } from "../common/i18n/locale";
 import { translateApi } from "../common/i18n/messages";
@@ -858,11 +859,13 @@ export class QueriesService {
       }
     }
 
-    return new Map(
-      [...aliasByIp.entries()].filter((entry): entry is [string, string] => {
-        const [, alias] = entry;
-        return alias !== null;
-      }),
-    );
+    const devices = readExternalIdentity().devices.filter(device => device.ips.some(ip => requestedIps.has(ip)));
+    const manual = devices.length ? await this.prisma.clientDevice.findMany({
+      where: { hwaddr: { in: devices.map(device => device.mac) }, alias: { not: null } },
+      select: { hwaddr: true, alias: true },
+    }) : [];
+    return mergeExternalAliases(new Map(
+      [...aliasByIp.entries()].filter((entry): entry is [string, string] => entry[1] !== null),
+    ), devices, new Map(manual.filter(item => Boolean(item.alias)).map(item => [item.hwaddr, item.alias as string])));
   }
 }
